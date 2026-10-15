@@ -1,0 +1,589 @@
+import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { constants as fsConstants } from 'node:fs'
+import { access, mkdtemp, readFile, rm, stat, statfs, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve as resolvePath } from 'node:path'
+import type {
+  Device,
+  DeviceControlAction,
+  DeviceLaunch,
+  DeviceTrackerEvent,
+  EnvironmentStatus,
+  LaunchConfig,
+  OperationResult,
+  RuntimeConfig,
+  ScrcpySession,
+  ScrcpySessionEvent,
+  SessionStopReason
+} from '../shared/types'
+import { buildScrcpyArgs, isSupportedScrcpyVersion, parseAdbDevices, prepareLaunchConfig, validateDeviceAddress } from './scrcpy'
+import { ScrcpySessionManager } from './sessionManager'
+import { buildCapabilitySnapshot } from './capabilities'
+import { DeviceTracker } from './deviceTracker'
+import { failureFromUnknown, operationFailure, operationErrorMessage } from '../shared/errors'
+import { adbService, adbServerStartedByApp, forgetAdbServerOwnership, noteAdbOutput } from './adbService'
+import { executeCommand, resolveBinary, type CommandOutput } from './runtime'
+
+const sessionManager = new ScrcpySessionManager()
+const MAX_SCREENSHOT_BYTES = 64 * 1024 * 1024
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+let trackerRuntime: RuntimeConfig = { scrcpyPath: '' }
+const deviceTracker = new DeviceTracker({
+  onAdbOutput: noteAdbOutput,
+  pollDevices: async () => {
+    const result = await listDevices(trackerRuntime)
+    if (!result.ok) throw new Error(operationErrorMessage(result, 'Unable to poll ADB devices.'))
+    return result.data || []
+  }
+})
+const CONTROL_KEYCODES: Partial<Record<DeviceControlAction, string>> = {
+  back: 'KEYCODE_BACK',
+  home: 'KEYCODE_HOME',
+  'app-switch': 'KEYCODE_APP_SWITCH',
+  menu: 'KEYCODE_MENU',
+  'volume-up': 'KEYCODE_VOLUME_UP',
+  'volume-down': 'KEYCODE_VOLUME_DOWN',
+  power: 'KEYCODE_POWER',
+  'screen-on': 'KEYCODE_WAKEUP',
+  'screen-off': 'KEYCODE_SLEEP'
+}
+
+function firstVersionLine(output: string, prefix: string): string {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.toLowerCase().startsWith(prefix)) || output.trim().split(/\r?\n/)[0] || ''
+}
+
+export async function getEnvironment(runtime: RuntimeConfig): Promise<EnvironmentStatus> {
+  const scrcpyPath = await resolveBinary(runtime, 'scrcpy')
+  const adbPath = await resolveBinary(runtime, 'adb')
+  const status: EnvironmentStatus = {
+    scrcpy: { ok: false, path: scrcpyPath, version: '', error: '' },
+    adb: { ok: false, path: adbPath, version: '', error: '' }
+  }
+
+  if (!scrcpyPath) {
+    status.scrcpy.error = 'scrcpy executable not found. Choose it in Runtime setup or add it to PATH.'
+  } else {
+    try {
+      const result = await executeCommand(scrcpyPath, ['--version'])
+      status.scrcpy.version = firstVersionLine(`${result.stdout}\n${result.stderr}`, 'scrcpy')
+      status.scrcpy.ok = isSupportedScrcpyVersion(status.scrcpy.version)
+      if (!status.scrcpy.ok) {
+        status.scrcpy.error = `scrcpy 4.x or newer is required; found ${status.scrcpy.version || 'an unknown version'}.`
+      } else {
+        try {
+          const help = await executeCommand(scrcpyPath, ['--help'])
+          status.scrcpy.capabilities = buildCapabilitySnapshot(`${help.stdout}\n${help.stderr}`)
+        } catch (error) {
+          status.scrcpy.capabilities = buildCapabilitySnapshot('')
+          status.scrcpy.capabilityError = error instanceof Error ? error.message : String(error)
+        }
+      }
+    } catch (error) {
+      status.scrcpy.error = error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  if (!adbPath) {
+    status.adb.error = 'adb executable not found. Install Android platform-tools or use a scrcpy bundle containing adb.'
+  } else {
+    try {
+      const result = await executeCommand(adbPath, ['version'])
+      status.adb.ok = true
+      status.adb.version = firstVersionLine(`${result.stdout}\n${result.stderr}`, 'android debug bridge')
+    } catch (error) {
+      status.adb.error = error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  return status
+}
+
+async function adbCommand(runtime: RuntimeConfig, args: string[]): Promise<CommandOutput> {
+  return adbService.run(runtime, args)
+}
+
+function executeBinary(file: string, args: string[], timeout = 20_000): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, { windowsHide: true, env: { ...process.env, LANG: 'en_US.UTF-8' } })
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    let size = 0
+    let settled = false
+    const timer = setTimeout(() => {
+      child.kill()
+      if (!settled) {
+        settled = true
+        reject(new Error('adb screenshot timed out.'))
+      }
+    }, timeout)
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > MAX_SCREENSHOT_BYTES) {
+        child.kill()
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+          reject(new Error('Device screenshot exceeded the 64 MB safety limit.'))
+        }
+        return
+      }
+      stdout.push(chunk)
+    })
+    child.stderr.on('data', (chunk: Buffer) => {
+      noteAdbOutput(String(chunk))
+      stderr.push(chunk)
+    })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (settled) return
+      settled = true
+      if (code !== 0) {
+        reject(new Error(Buffer.concat(stderr).toString().trim() || `adb exited with code ${code ?? 'unknown'}.`))
+        return
+      }
+      resolve(Buffer.concat(stdout))
+    })
+  })
+}
+
+interface ScreenshotCommandExecutor {
+  binary(file: string, args: string[], timeout?: number): Promise<Buffer>
+  command(file: string, args: string[], timeout?: number, maxBuffer?: number): Promise<CommandOutput>
+}
+
+const screenshotCommandExecutor: ScreenshotCommandExecutor = {
+  binary: executeBinary,
+  command: executeCommand
+}
+
+function isPngScreenshot(data: Buffer): boolean {
+  return data.length >= PNG_SIGNATURE.length && data.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+}
+
+function screenshotFailureMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function captureScreenshotThroughFile(
+  adbPath: string,
+  serial: string,
+  executor: ScreenshotCommandExecutor
+): Promise<Buffer> {
+  const remotePath = `/data/local/tmp/scrcpy-gui-${randomUUID()}.png`
+  const localDirectory = await mkdtemp(join(tmpdir(), 'scrcpy-gui-screenshot-'))
+  const localPath = join(localDirectory, 'screenshot.png')
+  try {
+    await executor.command(adbPath, ['-s', serial, 'shell', 'screencap', '-p', remotePath], 20_000)
+    await executor.command(adbPath, ['-s', serial, 'pull', remotePath, localPath], 20_000)
+    const captured = await stat(localPath)
+    if (captured.size > MAX_SCREENSHOT_BYTES) {
+      throw new Error('Device screenshot exceeded the 64 MB safety limit.')
+    }
+    return readFile(localPath)
+  } finally {
+    await executor.command(adbPath, ['-s', serial, 'shell', 'rm', '-f', remotePath], 5_000).catch(() => undefined)
+    await rm(localDirectory, { recursive: true, force: true }).catch(() => undefined)
+  }
+}
+
+export async function captureScreenshotPng(
+  adbPath: string,
+  serial: string,
+  executor: ScreenshotCommandExecutor = screenshotCommandExecutor
+): Promise<Buffer> {
+  const target = serial.trim()
+  let directFailure: unknown
+  try {
+    const direct = await executor.binary(adbPath, ['-s', target, 'exec-out', 'screencap', '-p'])
+    if (isPngScreenshot(direct)) return direct
+    directFailure = new Error(`ADB returned ${direct.length} bytes without a PNG signature.`)
+  } catch (error) {
+    directFailure = error
+  }
+
+  try {
+    const fallback = await captureScreenshotThroughFile(adbPath, target, executor)
+    if (isPngScreenshot(fallback)) return fallback
+    throw new Error(`ADB pulled ${fallback.length} bytes without a PNG signature.`)
+  } catch (fallbackFailure) {
+    throw new Error(
+      `The device did not return a valid PNG screenshot. Direct capture: ${screenshotFailureMessage(directFailure)} ` +
+      `File fallback: ${screenshotFailureMessage(fallbackFailure)}`
+    )
+  }
+}
+
+export async function listDevices(runtime: RuntimeConfig): Promise<OperationResult<Device[]>> {
+  try {
+    const result = await adbCommand(runtime, ['devices', '-l'])
+    return { ok: true, data: deviceTracker.synchronize(parseAdbDevices(result.stdout)) }
+  } catch (error) {
+    return failureFromUnknown(error, 'ADB_LIST_FAILED', 'device-list', 'Unable to list Android devices.', {
+      retryable: true,
+      suggestedActions: ['Recheck the runtime setup.', 'Reconnect the device and try again.']
+    })
+  }
+}
+
+export async function startDeviceTracker(runtime: RuntimeConfig): Promise<OperationResult<Device[]>> {
+  trackerRuntime = runtime
+  const adbPath = await resolveBinary(runtime, 'adb')
+  if (!adbPath) return operationFailure('ADB_NOT_FOUND', 'device-tracker', 'adb executable not found.', {
+    suggestedActions: ['Recheck the runtime setup.']
+  })
+  try {
+    return { ok: true, data: deviceTracker.start(adbPath) }
+  } catch (error) {
+    return failureFromUnknown(error, 'DEVICE_TRACKER_START_FAILED', 'device-tracker', 'Unable to start device tracking.', {
+      retryable: true,
+      suggestedActions: ['Recheck the runtime setup.', 'Try refreshing devices manually.']
+    })
+  }
+}
+
+export function subscribeDeviceTrackerEvents(listener: (event: DeviceTrackerEvent) => void): () => void {
+  return deviceTracker.subscribe(listener)
+}
+
+export function setDeviceTrackerVisibility(visible: boolean): void {
+  deviceTracker.setVisible(visible)
+}
+
+export function stopDeviceTracker(): void {
+  deviceTracker.stop()
+}
+
+export function listTrackedDevices(): Device[] {
+  return deviceTracker.snapshot()
+}
+
+export { adbServerStartedByApp }
+
+export async function stopAdbServer(runtime: RuntimeConfig): Promise<void> {
+  try {
+    await adbCommand(runtime, ['kill-server'])
+  } catch {
+    // Quitting must not be blocked if adb is already unavailable.
+  } finally {
+    forgetAdbServerOwnership()
+  }
+}
+
+export async function connectDevice(runtime: RuntimeConfig, target: string): Promise<OperationResult<string>> {
+  const address = target.trim()
+  if (!validateDeviceAddress(address)) {
+    return operationFailure('INVALID_DEVICE_ADDRESS', 'validation', 'Enter a valid host and optional port (1-65535).')
+  }
+  try {
+    const result = await adbCommand(runtime, ['connect', address])
+    const output = `${result.stdout}\n${result.stderr}`.trim()
+    const ok = /connected to|already connected to/i.test(output)
+    return ok ? { ok: true, data: output } : operationFailure('ADB_CONNECT_FAILED', 'device-connect', 'adb connect failed.', {
+      detail: output || undefined,
+      retryable: true,
+      suggestedActions: ['Confirm wireless debugging is enabled.', 'Verify that the host and port are reachable.']
+    })
+  } catch (error) {
+    return failureFromUnknown(error, 'ADB_CONNECT_FAILED', 'device-connect', 'Unable to connect to the device.', {
+      retryable: true,
+      suggestedActions: ['Confirm wireless debugging is enabled.', 'Verify that the host and port are reachable.']
+    })
+  }
+}
+
+export async function pairDevice(
+  runtime: RuntimeConfig,
+  target: string,
+  code: string
+): Promise<OperationResult<string>> {
+  const address = target.trim()
+  if (!validateDeviceAddress(address, true)) {
+    return operationFailure('INVALID_PAIR_ADDRESS', 'validation', 'Pairing requires a valid host:port.')
+  }
+  if (!/^\d{6}$/.test(code.trim())) {
+    return operationFailure('INVALID_PAIRING_CODE', 'validation', 'Pairing code must contain exactly six digits.')
+  }
+  try {
+    const result = await adbCommand(runtime, ['pair', address, code.trim()])
+    const output = `${result.stdout}\n${result.stderr}`.trim()
+    const ok = /successfully paired/i.test(output)
+    return ok ? { ok: true, data: output } : operationFailure('ADB_PAIR_FAILED', 'device-pair', 'adb pair failed.', {
+      detail: output || undefined,
+      retryable: true,
+      suggestedActions: ['Request a new pairing code.', 'Verify that the pairing host and port are correct.']
+    })
+  } catch (error) {
+    return failureFromUnknown(error, 'ADB_PAIR_FAILED', 'device-pair', 'Unable to pair the device.', {
+      retryable: true,
+      suggestedActions: ['Request a new pairing code.', 'Verify that the pairing host and port are correct.']
+    })
+  }
+}
+
+export async function disconnectDevice(runtime: RuntimeConfig, target: string): Promise<OperationResult<string>> {
+  const address = target.trim()
+  if (!validateDeviceAddress(address)) {
+    return operationFailure('INVALID_DEVICE_ADDRESS', 'validation', 'Enter a valid wireless device address.')
+  }
+  try {
+    const result = await adbCommand(runtime, ['disconnect', address])
+    const output = `${result.stdout}\n${result.stderr}`.trim()
+    return { ok: true, data: output }
+  } catch (error) {
+    return failureFromUnknown(error, 'ADB_DISCONNECT_FAILED', 'device-disconnect', 'Unable to disconnect the device.', {
+      retryable: true,
+      suggestedActions: ['Refresh the device list and try again.']
+    })
+  }
+}
+
+async function rotateDevice(runtime: RuntimeConfig, serial: string): Promise<string> {
+  const state = await adbCommand(runtime, ['-s', serial, 'shell', 'dumpsys', 'input'])
+  const output = `${state.stdout}\n${state.stderr}`
+  const match = output.match(/SurfaceOrientation:\s*([0-3])/i) || output.match(/orientation=([0-3])/i)
+  const next = ((match ? Number(match[1]) : 0) + 1) % 4
+  try {
+    await adbCommand(runtime, ['-s', serial, 'shell', 'wm', 'user-rotation', 'lock', String(next)])
+  } catch {
+    await adbCommand(runtime, ['-s', serial, 'shell', 'settings', 'put', 'system', 'accelerometer_rotation', '0'])
+    await adbCommand(runtime, ['-s', serial, 'shell', 'settings', 'put', 'system', 'user_rotation', String(next)])
+  }
+  return `Device rotated to orientation ${next}.`
+}
+
+export async function controlDevice(
+  runtime: RuntimeConfig,
+  serial: string,
+  action: DeviceControlAction
+): Promise<OperationResult<string>> {
+  const target = serial.trim()
+  if (!target) return operationFailure('DEVICE_REQUIRED', 'validation', 'Choose a device first.')
+  try {
+    if (action === 'rotate') return { ok: true, data: await rotateDevice(runtime, target) }
+    if (action === 'auto-rotate') {
+      try {
+        await adbCommand(runtime, ['-s', target, 'shell', 'wm', 'user-rotation', 'free'])
+      } catch {
+        await adbCommand(runtime, ['-s', target, 'shell', 'settings', 'put', 'system', 'accelerometer_rotation', '1'])
+      }
+      return { ok: true, data: `Automatic rotation restored on ${target}.` }
+    }
+    if (action === 'show-touches-on' || action === 'show-touches-off') {
+      await adbCommand(runtime, ['-s', target, 'shell', 'settings', 'put', 'system', 'show_touches', action === 'show-touches-on' ? '1' : '0'])
+      return { ok: true, data: `${action} sent to ${target}.` }
+    }
+    const keyCode = CONTROL_KEYCODES[action]
+    if (!keyCode) return operationFailure('UNSUPPORTED_CONTROL_ACTION', 'validation', 'Unsupported device control action.')
+    if (action === 'screen-on' || action === 'screen-off') {
+      try {
+        await adbCommand(runtime, ['-s', target, 'shell', 'cmd', 'display', action === 'screen-on' ? 'power-on' : 'power-off', '0'])
+        return { ok: true, data: `${action} sent to ${target}.` }
+      } catch {
+        // Older Android versions do not expose cmd display power controls.
+      }
+    }
+    await adbCommand(runtime, ['-s', target, 'shell', 'input', 'keyevent', keyCode])
+    return { ok: true, data: `${action} sent to ${target}.` }
+  } catch (error) {
+    return failureFromUnknown(error, 'DEVICE_CONTROL_FAILED', 'device-control', 'Unable to control the device.', {
+      retryable: true,
+      suggestedActions: ['Confirm that the device is still connected and authorized.']
+    })
+  }
+}
+
+export async function captureDeviceScreenshotBuffer(
+  runtime: RuntimeConfig,
+  serial: string
+): Promise<OperationResult<Buffer>> {
+  try {
+    const adbPath = await resolveBinary(runtime, 'adb')
+    if (!adbPath) return operationFailure('ADB_NOT_FOUND', 'screenshot', 'adb executable not found.', {
+      suggestedActions: ['Recheck the runtime setup.']
+    })
+    const png = await captureScreenshotPng(adbPath, serial.trim())
+    return { ok: true, data: png }
+  } catch (error) {
+    return failureFromUnknown(error, 'SCREENSHOT_FAILED', 'screenshot', 'Unable to capture the screenshot.', {
+      retryable: true,
+      suggestedActions: ['Confirm that the device is connected and unlocked.']
+    })
+  }
+}
+
+export async function captureDeviceScreenshot(
+  runtime: RuntimeConfig,
+  serial: string,
+  outputPath: string
+): Promise<OperationResult<string>> {
+  const capture = await captureDeviceScreenshotBuffer(runtime, serial)
+  if (!capture.ok) return { ok: false, error: capture.error }
+  if (!capture.data) return operationFailure('SCREENSHOT_FAILED', 'screenshot', 'Unable to capture the screenshot.')
+  try {
+    const png = capture.data
+    await writeFile(outputPath, png)
+    return { ok: true, data: outputPath }
+  } catch (error) {
+    return failureFromUnknown(error, 'SCREENSHOT_FAILED', 'screenshot', 'Unable to capture the screenshot.', {
+      retryable: true,
+      suggestedActions: ['Confirm that the device is connected and unlocked.']
+    })
+  }
+}
+
+export function subscribeScrcpySessionEvents(listener: (event: ScrcpySessionEvent) => void): () => void {
+  return sessionManager.subscribe(listener)
+}
+
+export function listScrcpySessions(): ScrcpySession[] {
+  return sessionManager.list()
+}
+
+export function duplicateRecordingPath(launches: DeviceLaunch[]): string | undefined {
+  const seen = new Set<string>()
+  for (const { launch } of launches) {
+    if (!launch.recordEnabled || launch.autoRecordName || !launch.recordPath.trim()) continue
+    const resolved = resolvePath(launch.recordPath.trim())
+    const key = process.platform === 'win32' ? resolved.toLocaleLowerCase() : resolved
+    if (seen.has(key)) return resolved
+    seen.add(key)
+  }
+  return undefined
+}
+
+export async function startScrcpy(
+  runtime: RuntimeConfig,
+  launches: DeviceLaunch[]
+): Promise<OperationResult<string[]>> {
+  const scrcpyPath = await resolveBinary(runtime, 'scrcpy')
+  if (!scrcpyPath) return operationFailure('SCRCPY_NOT_FOUND', 'session-preflight', 'scrcpy executable not found.', {
+    suggestedActions: ['Recheck the runtime setup.', 'Choose a scrcpy executable manually.']
+  })
+  try {
+    const result = await executeCommand(scrcpyPath, ['--version'])
+    const version = firstVersionLine(`${result.stdout}\n${result.stderr}`, 'scrcpy')
+    if (!isSupportedScrcpyVersion(version)) {
+      return operationFailure('SCRCPY_UNSUPPORTED', 'session-preflight', `scrcpy 4.x or newer is required; found ${version}.`, {
+        suggestedActions: ['Install or choose scrcpy 4.x or newer.']
+      })
+    }
+  } catch (error) {
+    return failureFromUnknown(error, 'SCRCPY_PREFLIGHT_FAILED', 'session-preflight', 'Unable to verify the scrcpy runtime.', {
+      retryable: true,
+      suggestedActions: ['Recheck the runtime setup.']
+    })
+  }
+  const uniqueLaunches = [...new Map(
+    launches
+      .filter((request) => request && request.serial.trim())
+      .map((request) => [request.serial.trim(), { serial: request.serial.trim(), launch: request.launch }])
+  ).values()]
+  if (uniqueLaunches.length === 0) return operationFailure('DEVICE_REQUIRED', 'validation', 'Select at least one device.')
+  if (duplicateRecordingPath(uniqueLaunches)) {
+    return operationFailure('RECORDING_PATH_CONFLICT', 'session-preflight', 'Multiple devices cannot record to the same file.', {
+      suggestedActions: ['Enable automatic recording names or choose a distinct Profile path for each device.']
+    })
+  }
+
+  const preparedLaunches: Array<{ serial: string; scene: LaunchConfig['scene']; args: string[] }> = []
+  for (const { serial, launch } of uniqueLaunches) {
+    try {
+      const prepared = prepareLaunchConfig(launch, serial)
+      await preflightLaunchOutputs(prepared)
+      preparedLaunches.push({ serial, scene: launch.scene, args: buildScrcpyArgs(prepared, serial) })
+    } catch (error) {
+      return failureFromUnknown(error, 'SESSION_OPTIONS_INVALID', 'session-preflight', 'Unable to prepare the scrcpy command.', {
+        suggestedActions: ['Review the command preview and expert arguments.']
+      })
+    }
+  }
+
+  const started: string[] = []
+  for (const { serial, scene, args } of preparedLaunches) {
+    const session = sessionManager.launch({ executable: scrcpyPath, serial, scene, args })
+    if (session.state !== 'failed') started.push(serial)
+  }
+
+  return started.length > 0
+    ? { ok: true, data: started }
+    : operationFailure('SESSION_START_FAILED', 'session-launch', 'No new scrcpy process was started.', {
+      retryable: true,
+      suggestedActions: ['Review the Sessions page and structured events for details.']
+    })
+}
+
+export async function preflightLaunchOutputs(launch: LaunchConfig): Promise<void> {
+  if (launch.recordEnabled && launch.recordPath.trim()) {
+    const directory = dirname(launch.recordPath.trim())
+    await access(directory, fsConstants.W_OK)
+    const fileSystem = await statfs(directory)
+    const available = Number(fileSystem.bavail) * Number(fileSystem.bsize)
+    if (Number.isFinite(available) && available < 64 * 1024 * 1024) {
+      throw new Error('Recording destination has less than 64 MiB available.')
+    }
+  }
+  if (launch.v4l2Sink.trim()) {
+    const sink = await stat(launch.v4l2Sink.trim())
+    if (!sink.isCharacterDevice()) throw new Error('V4L2 sink is not a character device.')
+    await access(launch.v4l2Sink.trim(), fsConstants.W_OK)
+  }
+}
+
+export async function startOtg(
+  runtime: RuntimeConfig,
+  launch: LaunchConfig,
+  usbSerial: string
+): Promise<OperationResult<string>> {
+  const scrcpyPath = await resolveBinary(runtime, 'scrcpy')
+  if (!scrcpyPath) return operationFailure('SCRCPY_NOT_FOUND', 'otg-preflight', 'scrcpy executable not found.')
+  if (launch.scene !== 'otg') return operationFailure('OTG_SCENE_REQUIRED', 'validation', 'OTG launch requires the OTG scene.')
+  try {
+    const result = await executeCommand(scrcpyPath, ['--version'])
+    const version = firstVersionLine(`${result.stdout}\n${result.stderr}`, 'scrcpy')
+    if (!isSupportedScrcpyVersion(version)) {
+      return operationFailure('SCRCPY_UNSUPPORTED', 'otg-preflight', `scrcpy 4.x or newer is required; found ${version}.`)
+    }
+    const serial = usbSerial.trim()
+    const args = buildScrcpyArgs(launch, serial)
+    const session = sessionManager.launch({
+      executable: scrcpyPath,
+      serial: serial || 'otg:auto-usb',
+      scene: 'otg',
+      args
+    })
+    return session.state === 'failed'
+      ? operationFailure('OTG_START_FAILED', 'otg-launch', session.error || 'Unable to start OTG mode.', {
+        suggestedActions: ['Disconnect other USB devices or enter the USB serial.', 'Review the Sessions page for USB permission errors.']
+      })
+      : { ok: true, data: session.id }
+  } catch (error) {
+    return failureFromUnknown(error, 'OTG_PREFLIGHT_FAILED', 'otg-preflight', 'Unable to prepare OTG mode.', {
+      retryable: true,
+      suggestedActions: ['Confirm that the device is connected over USB.', 'Review platform USB permissions.']
+    })
+  }
+}
+
+export function stopScrcpy(serial: string): OperationResult {
+  return sessionManager.stopBySerial(serial)
+}
+
+export function stopScrcpySession(id: string): OperationResult {
+  return sessionManager.stop(id)
+}
+
+export function stopAllScrcpy(reason: SessionStopReason = 'app-quit'): void {
+  sessionManager.stopAll(reason)
+}

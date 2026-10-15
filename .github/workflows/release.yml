@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            command: npm run dist:mac
+            artifact: macOS
+          - os: windows-latest
+            command: npm run dist:win
+            artifact: Windows
+          - os: ubuntu-latest
+            command: npm run dist:linux
+            artifact: Linux
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libarchive-tools
+      - run: npm ci
+      - run: npm test
+      - run: ${{ matrix.command }}
+      - name: Smoke packaged bundled runtime
+        run: npm run smoke:packaged-runtime
+      - name: Build Chocolatey package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $installer = Get-Item "release/Scrcpy.GUI-$version-win-x64.exe"
+          $checksum = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $script = 'packaging/chocolatey/tools/chocolateyInstall.ps1'
+          $content = Get-Content $script -Raw
+          $content = $content -replace '(?m)^\$checksum64 = ''[a-f0-9]+''$', "`$checksum64 = '$checksum'"
+          Set-Content $script $content -Encoding utf8
+          choco pack packaging/chocolatey/scrcpy-gui.nuspec --version $version --outputdirectory release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Scrcpy-GUI-${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.AppImage
+            release/*.deb
+            release/*.pacman
+            release/*.tar.gz
+            release/*.nupkg
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Export SPDX SBOM
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p artifacts/SBOM
+          curl --fail --location --silent --show-error \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/dependency-graph/sbom" \
+            | jq '.sbom' > "artifacts/SBOM/Scrcpy.GUI-$version.sbom.spdx.json"
+          jq --exit-status '.spdxVersion == "SPDX-2.3" and (.packages | length > 0)' \
+            "artifacts/SBOM/Scrcpy.GUI-$version.sbom.spdx.json" > /dev/null
+      - name: Generate SHA-256 manifest
+        shell: bash
+        run: |
+          find artifacts -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | awk '{ name=$2; sub(/^.*\//, "", name); print $1 "  " name }' \
+            | sort -k2 > SHA256SUMS.txt
+      - name: Attest release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            artifacts/**/*
+            SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v3
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/*
+            SHA256SUMS.txt
+
+  publish-chocolatey:
+    needs: [package, publish]
+    runs-on: windows-latest
+    env:
+      CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: Scrcpy-GUI-Windows
+          path: artifacts
+      - name: Push to Chocolatey Community Repository
+        shell: pwsh
+        run: |
+          if (-not $env:CHOCO_API_KEY) {
+            Write-Host 'CHOCO_API_KEY is not configured; the verified .nupkg remains attached to the GitHub release.'
+            exit 0
+          }
+          $package = Get-Item 'artifacts/*.nupkg'
+          choco push $package.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
